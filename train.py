@@ -7,17 +7,23 @@ encoder for the passage side.
 
 Only the contextualizer (+ its positional embeddings) receives gradients.
 
-Usage:
-    python train.py \
+Supports DDP (multi-GPU, one process per GPU). Launch with torchrun:
+
+    torchrun --nproc_per_node=4 train.py \
         --emb_bag_path llama3.2_3b.web_search_en.emb_bag.pt \
         --doc_model_name_or_path lightretriever/lightretriever-llama3.2-3b \
-        --subsets msmarco nq hotpotqa \
+        --attn_implementation sdpa \
+        --subsets msmarco \
         --output_dir ./outputs/contextualizer_llama3b \
-        --per_device_train_batch_size 64 \
+        --per_device_train_batch_size 32 \
         --num_train_epochs 1
 
+Single GPU still works exactly as before (just `python train.py ...`,
+no torchrun needed - the script detects it's not in a distributed launch).
+
 Resume:
-    python train.py ... --resume_from_checkpoint ./outputs/contextualizer_llama3b/checkpoint-last
+    torchrun --nproc_per_node=4 train.py ... \
+        --resume_from_checkpoint ./outputs/contextualizer_llama3b/checkpoint-last
 """
 import os
 import sys
@@ -30,8 +36,11 @@ import argparse
 from dataclasses import asdict
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoTokenizer, AutoModelForCausalLM, get_cosine_schedule_with_warmup
 from peft import LoraConfig, PeftModel
 
@@ -42,32 +51,71 @@ from dataset import load_finetune_data, RetrievalContrastiveDataset, Collator
 
 
 # --------------------------------------------------------------------------- #
-# Logging setup: everything goes to BOTH console and a log file.
+# Distributed setup
 # --------------------------------------------------------------------------- #
-def setup_logging(output_dir: str, log_file: str) -> logging.Logger:
-    os.makedirs(output_dir, exist_ok=True)
-    log_path = os.path.join(output_dir, log_file)
+def setup_distributed():
+    """Detects a torchrun launch via env vars set by torchrun (RANK, WORLD_SIZE,
+    LOCAL_RANK). Falls back to single-process/single-GPU if not present."""
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        dist.init_process_group(backend="nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        is_distributed = True
+    else:
+        rank, world_size, local_rank = 0, 1, 0
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        is_distributed = False
+    return rank, world_size, local_rank, device, is_distributed
 
+
+def is_main_process(rank: int) -> bool:
+    return rank == 0
+
+
+def reduce_mean(value: float, device: torch.device, distributed: bool, world_size: int) -> float:
+    """Average a python float metric across all ranks."""
+    if not distributed:
+        return value
+    t = torch.tensor([value], dtype=torch.float32, device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return (t / world_size).item()
+
+
+# --------------------------------------------------------------------------- #
+# Logging setup: rank 0 writes to console + log file; other ranks stay quiet
+# (only warnings/errors to console) to avoid interleaved/corrupted log files.
+# --------------------------------------------------------------------------- #
+def setup_logging(output_dir: str, log_file: str, rank: int) -> logging.Logger:
     logger = logging.getLogger("contextualizer_train")
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.INFO if is_main_process(rank) else logging.WARNING)
     logger.handlers.clear()
 
-    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    fmt = logging.Formatter(f"%(asctime)s | rank{rank} | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
-    file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
-    file_handler.setFormatter(fmt)
-    logger.addHandler(file_handler)
+    if is_main_process(rank):
+        os.makedirs(output_dir, exist_ok=True)
+        log_path = os.path.join(output_dir, log_file)
+        file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+        file_handler.setFormatter(fmt)
+        logger.addHandler(file_handler)
 
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(fmt)
     logger.addHandler(stream_handler)
 
-    logger.info(f"Logging to console and to: {log_path}")
+    if is_main_process(rank):
+        logger.info(f"Logging to console and to: {os.path.join(output_dir, log_file)}")
     return logger
 
 
 # --------------------------------------------------------------------------- #
 # Frozen document encoder (identical setup to scripts/asymmetric_dense_infer.ipynb)
+# Each rank loads its OWN copy onto its OWN GPU - it's frozen/eval-only, so
+# there's no need (and no way) to DDP-wrap it; every rank just needs a local
+# copy to encode its own shard of documents.
 # --------------------------------------------------------------------------- #
 def load_frozen_doc_model(model_name_or_path: str, attn_implementation: str, device: torch.device):
     config = LoraConfig.from_pretrained(model_name_or_path)
@@ -110,21 +158,20 @@ def encode_documents(doc_model, input_ids, attention_mask) -> torch.Tensor:
 
 # --------------------------------------------------------------------------- #
 # Symmetric (bidirectional) InfoNCE loss
+# NOTE: under DDP, each rank only sees its own local batch's documents as
+# negatives (this loss does NOT gather documents across ranks). Effective
+# in-batch negative pool per step = per_device_train_batch_size * (1+k),
+# same as single-GPU, just parallelized across more queries/sec, not a
+# larger negative pool. See note below train() if you want cross-rank
+# negative gathering instead.
 # --------------------------------------------------------------------------- #
 def symmetric_infonce_loss(query_emb: torch.Tensor, doc_emb: torch.Tensor,
                             positive_indices: torch.Tensor, temperature: float):
-    """
-    query_emb: [B, H] normalized
-    doc_emb:   [N, H] normalized  (N = sum over batch of (1 pos + k negs))
-    positive_indices: [B] -> index into doc_emb of each query's true positive
-    """
     scores = query_emb @ doc_emb.T / temperature   # [B, N]
 
-    # Query -> Document direction
     loss_q2d = F.cross_entropy(scores, positive_indices)
 
-    # Document -> Query direction (only defined for the positive docs)
-    pos_doc_scores = scores.T[positive_indices]     # [B, B]  (row j = doc of query j, col i = query i)
+    pos_doc_scores = scores.T[positive_indices]     # [B, B]
     targets_d2q = torch.arange(pos_doc_scores.size(0), device=scores.device)
     loss_d2q = F.cross_entropy(pos_doc_scores, targets_d2q)
 
@@ -136,15 +183,21 @@ def symmetric_infonce_loss(query_emb: torch.Tensor, doc_emb: torch.Tensor,
 
 
 # --------------------------------------------------------------------------- #
-# Checkpointing
+# Checkpointing (rank 0 only)
 # --------------------------------------------------------------------------- #
-def save_checkpoint(output_dir, step, model, optimizer, scheduler, best_metric, save_total_limit, logger):
+def unwrap(model):
+    return model.module if isinstance(model, DDP) else model
+
+
+def save_checkpoint(output_dir, step, model, optimizer, scheduler, best_metric, save_total_limit, logger, rank):
+    if not is_main_process(rank):
+        return
     ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
     os.makedirs(ckpt_dir, exist_ok=True)
 
     torch.save({
         "step": step,
-        "model_state_dict": model.state_dict(),          # contextualizer only (frozen doc/table excluded via requires_grad, but state_dict includes buffers - fine, they're identical/frozen anyway)
+        "model_state_dict": unwrap(model).state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "best_metric": best_metric,
@@ -154,7 +207,6 @@ def save_checkpoint(output_dir, step, model, optimizer, scheduler, best_metric, 
         },
     }, os.path.join(ckpt_dir, "training_state.pt"))
 
-    # Convenience symlink/copy for easy resume
     latest_dir = os.path.join(output_dir, "checkpoint-last")
     if os.path.exists(latest_dir):
         shutil.rmtree(latest_dir)
@@ -162,7 +214,6 @@ def save_checkpoint(output_dir, step, model, optimizer, scheduler, best_metric, 
 
     logger.info(f"Saved checkpoint at step {step} -> {ckpt_dir}")
 
-    # Enforce save_total_limit (keep only the N most recent numbered checkpoints; "checkpoint-last" is always kept)
     numbered = sorted(
         glob.glob(os.path.join(output_dir, "checkpoint-*")),
         key=lambda p: int(p.split("-")[-1]) if p.split("-")[-1].isdigit() else -1,
@@ -174,22 +225,23 @@ def save_checkpoint(output_dir, step, model, optimizer, scheduler, best_metric, 
         logger.info(f"Removed old checkpoint: {to_remove}")
 
 
-def load_checkpoint(ckpt_dir, model, optimizer, scheduler, logger):
-    state = torch.load(os.path.join(ckpt_dir, "training_state.pt"), map_location="cpu")
-    model.load_state_dict(state["model_state_dict"])
+def load_checkpoint(ckpt_dir, model, optimizer, scheduler, logger, device):
+    state = torch.load(os.path.join(ckpt_dir, "training_state.pt"), map_location=device)
+    unwrap(model).load_state_dict(state["model_state_dict"])
     optimizer.load_state_dict(state["optimizer_state_dict"])
     scheduler.load_state_dict(state["scheduler_state_dict"])
-    torch.set_rng_state(state["rng_state"]["torch"])
-    torch.cuda.set_rng_state_all(state["rng_state"]["cuda"])
+    torch.set_rng_state(state["rng_state"]["torch"].cpu())
+    torch.cuda.set_rng_state_all([s.cpu() for s in state["rng_state"]["cuda"]])
     logger.info(f"Resumed from {ckpt_dir} at step {state['step']}")
     return state["step"], state.get("best_metric", -1.0)
 
 
 # --------------------------------------------------------------------------- #
-# Evaluation
+# Evaluation - every rank evaluates its own shard, metrics are all-reduced
+# (averaged) so the logged number reflects the full validation set.
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
-def evaluate(model, doc_model, val_loader, device, temperature, logger, max_batches: int = 50):
+def evaluate(model, doc_model, val_loader, device, temperature, logger, distributed, world_size, max_batches: int = 50):
     model.eval()
     total_acc, total_loss, n = 0.0, 0.0, 0
     for i, batch in enumerate(val_loader):
@@ -214,12 +266,16 @@ def evaluate(model, doc_model, val_loader, device, temperature, logger, max_batc
     model.train()
     avg_loss = total_loss / max(n, 1)
     avg_acc = total_acc / max(n, 1)
-    logger.info(f"[EVAL] loss={avg_loss:.4f} acc@1={avg_acc:.4f} (over {n} batches)")
+
+    avg_loss = reduce_mean(avg_loss, device, distributed, world_size)
+    avg_acc = reduce_mean(avg_acc, device, distributed, world_size)
+
+    logger.info(f"[EVAL] loss={avg_loss:.4f} acc@1={avg_acc:.4f} (over {n} local batches/rank)")
     return avg_acc
 
 
 # --------------------------------------------------------------------------- #
-# Main
+# Args
 # --------------------------------------------------------------------------- #
 def parse_args():
     p = argparse.ArgumentParser()
@@ -252,6 +308,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    rank, world_size, local_rank, device, distributed = setup_distributed()
 
     model_cfg = ModelConfig(
         doc_model_name_or_path=args.doc_model_name_or_path,
@@ -284,88 +341,122 @@ def main():
         resume_from_checkpoint=args.resume_from_checkpoint,
     )
 
-    logger = setup_logging(train_cfg.output_dir, train_cfg.log_file)
-    logger.info("===== Config =====")
-    logger.info(json.dumps({
-        "model": asdict(model_cfg), "data": asdict(data_cfg), "train": asdict(train_cfg)
-    }, indent=2, default=str))
+    logger = setup_logging(train_cfg.output_dir, train_cfg.log_file, rank)
+    if is_main_process(rank):
+        logger.info(f"Distributed: {distributed} | world_size={world_size}")
+        logger.info("===== Config =====")
+        logger.info(json.dumps({
+            "model": asdict(model_cfg), "data": asdict(data_cfg), "train": asdict(train_cfg)
+        }, indent=2, default=str))
 
+    # Same seed on every rank -> identical model init before DDP broadcast,
+    # identical dropout patterns per-rank-position. DistributedSampler
+    # handles giving each rank a different data shard despite the same seed.
     set_seed(train_cfg.seed)
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    # ---- Tokenizer (shared for query + doc, same model family) ----
     tokenizer = AutoTokenizer.from_pretrained(model_cfg.doc_model_name_or_path)
 
-    # ---- Frozen document encoder ----
-    logger.info(f"Loading frozen document encoder: {model_cfg.doc_model_name_or_path} "
-                f"(attn_implementation={model_cfg.attn_implementation})")
+    if is_main_process(rank):
+        logger.info(f"Loading frozen document encoder: {model_cfg.doc_model_name_or_path} "
+                    f"(attn_implementation={model_cfg.attn_implementation})")
     doc_model = load_frozen_doc_model(model_cfg.doc_model_name_or_path, model_cfg.attn_implementation, device)
 
-    # ---- Frozen lookup table ----
-    logger.info(f"Loading frozen EmbeddingBag weights from: {model_cfg.emb_bag_path}")
+    if is_main_process(rank):
+        logger.info(f"Loading frozen EmbeddingBag weights from: {model_cfg.emb_bag_path}")
     emb_bag_weight = torch.load(model_cfg.emb_bag_path, map_location="cpu")
 
-    # ---- Trainable contextualizer ----
     model = QueryContextualizer(model_cfg, emb_bag_weight, pad_token_id=tokenizer.pad_token_id)
-    model.to(device=device, dtype=torch.float32)  # keep trainable params in fp32 master weights; autocast handles bf16 compute
-    n_trainable = sum(p.numel() for p in model.trainable_parameters())
-    n_frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
-    logger.info(f"Contextualizer trainable params: {n_trainable:,} | frozen (lookup table) params: {n_frozen:,}")
+    model.to(device=device, dtype=torch.float32)
 
-    # ---- Data ----
-    logger.info(f"Loading dataset subsets: {data_cfg.subsets}")
+    if distributed:
+        # find_unused_parameters=False: every trainable param participates in
+        # every forward pass here, so keep this False for speed.
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+
+    n_trainable = sum(p.numel() for p in unwrap(model).trainable_parameters())
+    n_frozen = sum(p.numel() for p in unwrap(model).parameters() if not p.requires_grad)
+    if is_main_process(rank):
+        logger.info(f"Contextualizer trainable params: {n_trainable:,} | frozen (lookup table) params: {n_frozen:,}")
+
+    if is_main_process(rank):
+        logger.info(f"Loading dataset subsets: {data_cfg.subsets}")
     train_hf, val_hf = load_finetune_data(
         data_cfg.dataset_name, data_cfg.subsets, data_cfg.train_split, data_cfg.seed, data_cfg.val_fraction
     )
-    logger.info(f"Train examples: {len(train_hf):,} | Val examples: {len(val_hf):,}")
+    if is_main_process(rank):
+        logger.info(f"Train examples: {len(train_hf):,} | Val examples: {len(val_hf):,}")
 
-    train_ds = RetrievalContrastiveDataset(train_hf, data_cfg.num_hard_negatives, data_cfg.seed)
-    val_ds = RetrievalContrastiveDataset(val_hf, data_cfg.num_hard_negatives, data_cfg.seed + 1)
+    train_ds = RetrievalContrastiveDataset(train_hf, data_cfg.num_hard_negatives, data_cfg.seed + rank)
+    val_ds = RetrievalContrastiveDataset(val_hf, data_cfg.num_hard_negatives, data_cfg.seed + 1 + rank)
 
     collator = Collator(tokenizer, data_cfg.max_query_len, data_cfg.max_doc_len)
 
-    g = torch.Generator()
-    g.manual_seed(train_cfg.seed)
-    train_loader = DataLoader(
-        train_ds, batch_size=train_cfg.per_device_train_batch_size, shuffle=True,
-        collate_fn=collator, num_workers=train_cfg.num_workers, worker_init_fn=seed_worker,
-        generator=g, drop_last=True, pin_memory=True,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=train_cfg.per_device_train_batch_size, shuffle=False,
-        collate_fn=collator, num_workers=train_cfg.num_workers, pin_memory=True,
-    )
+    if distributed:
+        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, seed=train_cfg.seed, drop_last=True)
+        val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
+        train_loader = DataLoader(
+            train_ds, batch_size=train_cfg.per_device_train_batch_size, sampler=train_sampler,
+            collate_fn=collator, num_workers=train_cfg.num_workers, worker_init_fn=seed_worker,
+            drop_last=True, pin_memory=True,
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=train_cfg.per_device_train_batch_size, sampler=val_sampler,
+            collate_fn=collator, num_workers=train_cfg.num_workers, pin_memory=True,
+        )
+    else:
+        train_sampler = None
+        g = torch.Generator()
+        g.manual_seed(train_cfg.seed)
+        train_loader = DataLoader(
+            train_ds, batch_size=train_cfg.per_device_train_batch_size, shuffle=True,
+            collate_fn=collator, num_workers=train_cfg.num_workers, worker_init_fn=seed_worker,
+            generator=g, drop_last=True, pin_memory=True,
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=train_cfg.per_device_train_batch_size, shuffle=False,
+            collate_fn=collator, num_workers=train_cfg.num_workers, pin_memory=True,
+        )
 
-    # ---- Optimizer / scheduler ----
     steps_per_epoch = len(train_loader) // train_cfg.gradient_accumulation_steps
     total_steps = train_cfg.max_steps or int(steps_per_epoch * train_cfg.num_train_epochs)
     warmup_steps = int(total_steps * train_cfg.warmup_ratio)
 
     optimizer = torch.optim.AdamW(
-        model.trainable_parameters(), lr=train_cfg.learning_rate, weight_decay=train_cfg.weight_decay
+        unwrap(model).trainable_parameters(), lr=train_cfg.learning_rate, weight_decay=train_cfg.weight_decay
     )
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
-    logger.info(f"Total optimizer steps: {total_steps} | warmup steps: {warmup_steps}")
+    if is_main_process(rank):
+        logger.info(f"Total optimizer steps: {total_steps} | warmup steps: {warmup_steps} "
+                    f"| world_size={world_size} | effective batch size="
+                    f"{train_cfg.per_device_train_batch_size * world_size * train_cfg.gradient_accumulation_steps}")
 
     global_step = 0
     best_metric = -1.0
     if train_cfg.resume_from_checkpoint:
         global_step, best_metric = load_checkpoint(
-            train_cfg.resume_from_checkpoint, model, optimizer, scheduler, logger
+            train_cfg.resume_from_checkpoint, model, optimizer, scheduler, logger, device
         )
+        if distributed:
+            dist.barrier()
 
-    # ---- Training loop ----
     model.train()
     running_loss, running_acc = 0.0, 0.0
     t0 = time.time()
     step_in_accum = 0
+    epoch = 0
 
     data_iter = iter(train_loader)
+    if distributed:
+        train_sampler.set_epoch(epoch)
+
     while global_step < total_steps:
         try:
             batch = next(data_iter)
         except StopIteration:
+            epoch += 1
+            if distributed:
+                train_sampler.set_epoch(epoch)
             data_iter = iter(train_loader)
             batch = next(data_iter)
 
@@ -375,21 +466,26 @@ def main():
         doc_attention_mask = batch["doc_attention_mask"].to(device)
         positive_indices = batch["positive_indices"].to(device)
 
-        query_emb = model(query_input_ids, query_attention_mask)  # fp32, autograd-tracked
+        step_in_accum += 1
+        is_sync_step = (step_in_accum == train_cfg.gradient_accumulation_steps)
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            doc_emb = encode_documents(doc_model, doc_input_ids, doc_attention_mask)
-        doc_emb = doc_emb.float()  # no grad here anyway (frozen), cast up for stable loss compute
+        # Skip DDP gradient all-reduce on non-final accumulation micro-steps.
+        sync_ctx = model.no_sync() if (distributed and not is_sync_step) else _nullcontext()
+        with sync_ctx:
+            query_emb = model(query_input_ids, query_attention_mask)
 
-        loss, acc = symmetric_infonce_loss(query_emb, doc_emb, positive_indices, train_cfg.temperature)
-        (loss / train_cfg.gradient_accumulation_steps).backward()
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                doc_emb = encode_documents(doc_model, doc_input_ids, doc_attention_mask)
+            doc_emb = doc_emb.float()
+
+            loss, acc = symmetric_infonce_loss(query_emb, doc_emb, positive_indices, train_cfg.temperature)
+            (loss / train_cfg.gradient_accumulation_steps).backward()
 
         running_loss += loss.item()
         running_acc += acc
-        step_in_accum += 1
 
-        if step_in_accum == train_cfg.gradient_accumulation_steps:
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), train_cfg.max_grad_norm)
+        if is_sync_step:
+            grad_norm = torch.nn.utils.clip_grad_norm_(unwrap(model).trainable_parameters(), train_cfg.max_grad_norm)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
@@ -398,32 +494,54 @@ def main():
 
             if global_step % train_cfg.logging_steps == 0:
                 elapsed = time.time() - t0
-                avg_loss = running_loss / (train_cfg.logging_steps * train_cfg.gradient_accumulation_steps)
-                avg_acc = running_acc / (train_cfg.logging_steps * train_cfg.gradient_accumulation_steps)
-                lr = scheduler.get_last_lr()[0]
-                logger.info(
-                    f"step={global_step}/{total_steps} loss={avg_loss:.4f} acc@1={avg_acc:.4f} "
-                    f"lr={lr:.2e} grad_norm={grad_norm:.3f} sec/step={elapsed / train_cfg.logging_steps:.2f}"
+                avg_loss = reduce_mean(
+                    running_loss / (train_cfg.logging_steps * train_cfg.gradient_accumulation_steps),
+                    device, distributed, world_size,
                 )
+                avg_acc = reduce_mean(
+                    running_acc / (train_cfg.logging_steps * train_cfg.gradient_accumulation_steps),
+                    device, distributed, world_size,
+                )
+                lr = scheduler.get_last_lr()[0]
+                if is_main_process(rank):
+                    logger.info(
+                        f"step={global_step}/{total_steps} loss={avg_loss:.4f} acc@1={avg_acc:.4f} "
+                        f"lr={lr:.2e} grad_norm={grad_norm:.3f} sec/step={elapsed / train_cfg.logging_steps:.2f}"
+                    )
                 running_loss, running_acc = 0.0, 0.0
                 t0 = time.time()
 
             if global_step % train_cfg.eval_steps == 0:
-                metric = evaluate(model, doc_model, val_loader, device, train_cfg.temperature, logger)
+                metric = evaluate(model, doc_model, val_loader, device, train_cfg.temperature, logger, distributed, world_size)
                 if metric > best_metric:
                     best_metric = metric
-                    logger.info(f"New best acc@1={best_metric:.4f} at step {global_step}")
+                    if is_main_process(rank):
+                        logger.info(f"New best acc@1={best_metric:.4f} at step {global_step}")
 
             if global_step % train_cfg.save_steps == 0:
                 save_checkpoint(
                     train_cfg.output_dir, global_step, model, optimizer, scheduler,
-                    best_metric, train_cfg.save_total_limit, logger
+                    best_metric, train_cfg.save_total_limit, logger, rank
                 )
+                if distributed:
+                    dist.barrier()
 
-    # Final checkpoint
     save_checkpoint(train_cfg.output_dir, global_step, model, optimizer, scheduler,
-                     best_metric, train_cfg.save_total_limit, logger)
-    logger.info("Training complete.")
+                     best_metric, train_cfg.save_total_limit, logger, rank)
+    if is_main_process(rank):
+        logger.info("Training complete.")
+
+    if distributed:
+        dist.barrier()
+        dist.destroy_process_group()
+
+
+class _nullcontext:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *exc):
+        return False
 
 
 if __name__ == "__main__":
