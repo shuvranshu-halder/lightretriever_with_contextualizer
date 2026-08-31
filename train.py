@@ -118,10 +118,11 @@ def setup_logging(output_dir: str, log_file: str, rank: int) -> logging.Logger:
 # there's no need (and no way) to DDP-wrap it; every rank just needs a local
 # copy to encode its own shard of documents.
 # --------------------------------------------------------------------------- #
-def load_frozen_doc_model(model_name_or_path: str, attn_implementation: str, device: torch.device):
+def load_frozen_doc_model(model_name_or_path: str, attn_implementation: str, device: torch.device,
+                           base_model_path: str = None):
     config = LoraConfig.from_pretrained(model_name_or_path)
     base_model = AutoModelForCausalLM.from_pretrained(
-        config.base_model_name_or_path,
+        base_model_path or config.base_model_name_or_path,  # local path overrides Hub id if given
         torch_dtype=torch.bfloat16,
         attn_implementation=attn_implementation,  # "sdpa" per user's choice
         device_map=device,
@@ -279,8 +280,18 @@ def evaluate(model, doc_model, val_loader, device, temperature, logger, distribu
 # Args
 # --------------------------------------------------------------------------- #
 def parse_args():
+    data_cfg = DataConfig()
     p = argparse.ArgumentParser()
     p.add_argument("--doc_model_name_or_path", type=str, default=ModelConfig.doc_model_name_or_path)
+    p.add_argument(
+        "--base_model_path",
+        dest="base_model_path",
+        type=str,
+        default=None,
+        help="Local folder for the already-downloaded base model (e.g. meta-llama/Llama-3.2-3B), "
+             "to avoid re-downloading. Only the base LLM weights - the LoRA adapter itself "
+             "(--doc_model_name_or_path) is still fetched from the Hub as usual (it's small)."
+    )
     p.add_argument("--attn_implementation", type=str, default=ModelConfig.attn_implementation)
     p.add_argument("--emb_bag_path", type=str, required=True)
     p.add_argument("--num_layers", type=int, default=ModelConfig.num_layers)
@@ -289,7 +300,7 @@ def parse_args():
     p.add_argument("--prepared_dataset_dir", type=str, default=None,
                     help="Path built by prepare_dataset.py. If set, skips all HF download/mixture logic "
                          "below and loads this local, pre-built dataset directly (no network needed).")
-    p.add_argument("--subsets", type=str, nargs="+", default=DataConfig.subsets)
+    p.add_argument("--subsets", type=str, nargs="+", default=data_cfg.subsets)
     p.add_argument("--dataset_percentage", type=float, default=DataConfig.dataset_percentage,
                     help="Keep only this percent of each subset's rows, e.g. 10 = 10%%")
     p.add_argument("--data_mixture_config", type=str, default=None,
@@ -375,7 +386,8 @@ def main():
     if is_main_process(rank):
         logger.info(f"Loading frozen document encoder: {model_cfg.doc_model_name_or_path} "
                     f"(attn_implementation={model_cfg.attn_implementation})")
-    doc_model = load_frozen_doc_model(model_cfg.doc_model_name_or_path, model_cfg.attn_implementation, device)
+    doc_model = load_frozen_doc_model(model_cfg.doc_model_name_or_path, model_cfg.attn_implementation, device,
+                                       base_model_path=args.base_model_path)
 
     if is_main_process(rank):
         logger.info(f"Loading frozen EmbeddingBag weights from: {model_cfg.emb_bag_path}")
