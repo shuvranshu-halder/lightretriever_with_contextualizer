@@ -43,6 +43,9 @@ class DataConfig:
     # HF dataset "config name" (subset). Pass a list to interleave multiple subsets.
     subsets: list = field(default_factory=lambda: ["msmarco"])
     num_hard_negatives: int = 7     # sampled per query, in addition to in-batch negatives
+    dataset_percentage: float = 100.0  # keep only this % of each subset (e.g. 10.0 = 10%)
+    data_mixture_config: Optional[str] = None  # path to exp-m.json style file for budget-based loading
+    disk_budget_gb: Optional[float] = None     # if set (with data_mixture_config), overrides subsets/dataset_percentage entirely
     max_doc_len: int = 256
     max_query_len: int = 64         # tokens, excludes special tokens/prompt
     train_split: str = "train"

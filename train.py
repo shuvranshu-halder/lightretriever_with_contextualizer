@@ -47,7 +47,8 @@ from peft import LoraConfig, PeftModel
 from config import ModelConfig, DataConfig, TrainConfig
 from seeding import set_seed, seed_worker
 from contextualizer import QueryContextualizer
-from dataset import load_finetune_data, RetrievalContrastiveDataset, Collator
+from datasets import load_from_disk
+from dataset import load_finetune_data, load_finetune_data_with_budget, RetrievalContrastiveDataset, Collator
 
 
 # --------------------------------------------------------------------------- #
@@ -285,7 +286,19 @@ def parse_args():
     p.add_argument("--num_layers", type=int, default=ModelConfig.num_layers)
     p.add_argument("--num_heads", type=int, default=ModelConfig.num_heads)
 
+    p.add_argument("--prepared_dataset_dir", type=str, default=None,
+                    help="Path built by prepare_dataset.py. If set, skips all HF download/mixture logic "
+                         "below and loads this local, pre-built dataset directly (no network needed).")
     p.add_argument("--subsets", type=str, nargs="+", default=DataConfig.subsets)
+    p.add_argument("--dataset_percentage", type=float, default=DataConfig.dataset_percentage,
+                    help="Keep only this percent of each subset's rows, e.g. 10 = 10%%")
+    p.add_argument("--data_mixture_config", type=str, default=None,
+                    help="Path to exp-m.json (cloned lightretriever repo: config/data/exp-m.json). "
+                         "If set together with --disk_budget_gb, this overrides --subsets/--dataset_percentage "
+                         "and builds a budget-constrained set of subsets proportional to the official domain_weights.")
+    p.add_argument("--disk_budget_gb", type=float, default=None,
+                    help="Hard cap (in GB) on total downloaded parquet data, allocated across subsets "
+                         "proportional to domain_weights from --data_mixture_config.")
     p.add_argument("--num_hard_negatives", type=int, default=DataConfig.num_hard_negatives)
     p.add_argument("--max_doc_len", type=int, default=DataConfig.max_doc_len)
     p.add_argument("--max_query_len", type=int, default=DataConfig.max_query_len)
@@ -320,6 +333,9 @@ def main():
     )
     data_cfg = DataConfig(
         subsets=args.subsets,
+        dataset_percentage=args.dataset_percentage,
+        data_mixture_config=args.data_mixture_config,
+        disk_budget_gb=args.disk_budget_gb,
         num_hard_negatives=args.num_hard_negatives,
         max_doc_len=args.max_doc_len,
         max_query_len=args.max_query_len,
@@ -380,9 +396,24 @@ def main():
 
     if is_main_process(rank):
         logger.info(f"Loading dataset subsets: {data_cfg.subsets}")
-    train_hf, val_hf = load_finetune_data(
-        data_cfg.dataset_name, data_cfg.subsets, data_cfg.train_split, data_cfg.seed, data_cfg.val_fraction
-    )
+    if args.prepared_dataset_dir:
+        if is_main_process(rank):
+            logger.info(f"Loading pre-built dataset from: {args.prepared_dataset_dir} (no network)")
+        dsd = load_from_disk(args.prepared_dataset_dir)
+        train_hf, val_hf = dsd["train"], dsd["validation"]
+    elif data_cfg.data_mixture_config and data_cfg.disk_budget_gb:
+        if is_main_process(rank):
+            logger.info(f"Using budget-constrained mixture loading: "
+                        f"config={data_cfg.data_mixture_config} budget={data_cfg.disk_budget_gb}GB")
+        train_hf, val_hf = load_finetune_data_with_budget(
+            data_cfg.dataset_name, data_cfg.data_mixture_config, data_cfg.disk_budget_gb,
+            data_cfg.val_fraction, data_cfg.seed,
+        )
+    else:
+        train_hf, val_hf = load_finetune_data(
+            data_cfg.dataset_name, data_cfg.subsets, data_cfg.train_split, data_cfg.seed, data_cfg.val_fraction,
+            dataset_percentage=data_cfg.dataset_percentage,
+        )
     if is_main_process(rank):
         logger.info(f"Train examples: {len(train_hf):,} | Val examples: {len(val_hf):,}")
 
