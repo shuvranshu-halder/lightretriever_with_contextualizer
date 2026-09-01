@@ -52,9 +52,9 @@ GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-2}"
 NUM_EPOCHS="${NUM_EPOCHS:-1}"
 NUM_LAYERS="${NUM_LAYERS:-3}"
 LEARNING_RATE="${LEARNING_RATE:-2e-4}"
-LOGGING_STEPS="${LOGGING_STEPS:-1}"    # lower this (e.g. 1-5) for small/smoke-test datasets
-EVAL_STEPS="${EVAL_STEPS:-4}"         # must be <= total_steps to ever fire
-SAVE_STEPS="${SAVE_STEPS:-6}"         # same
+LOGGING_STEPS="${LOGGING_STEPS:-40}"    # lower this (e.g. 1-5) for small/smoke-test datasets
+EVAL_STEPS="${EVAL_STEPS:-400}"         # must be <= total_steps to ever fire
+SAVE_STEPS="${SAVE_STEPS:-400}"         # same
 SEED="${SEED:-42}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
 USE_WANDB="${USE_WANDB:-1}"                       # 1 = enable W&B logging
