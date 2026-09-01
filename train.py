@@ -47,6 +47,12 @@ from peft import LoraConfig, PeftModel
 from config import ModelConfig, DataConfig, TrainConfig
 from seeding import set_seed, seed_worker
 from contextualizer import QueryContextualizer
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 from datasets import load_from_disk
 from dataset import load_finetune_data, load_finetune_data_with_budget, RetrievalContrastiveDataset, Collator
 
@@ -326,6 +332,10 @@ def parse_args():
     p.add_argument("--save_steps", type=int, default=TrainConfig.save_steps)
     p.add_argument("--save_total_limit", type=int, default=TrainConfig.save_total_limit)
     p.add_argument("--seed", type=int, default=TrainConfig.seed)
+    p.add_argument("--use_wandb", action="store_true", help="Log metrics to Weights & Biases.")
+    p.add_argument("--wandb_project", type=str, default="lightretriever-contextualizer")
+    p.add_argument("--wandb_run_name", type=str, default=None)
+    p.add_argument("--wandb_entity", type=str, default=None, help="Your W&B username or team name (optional).")
     p.add_argument("--resume_from_checkpoint", type=str, default=None)
     return p.parse_args()
 
@@ -372,9 +382,24 @@ def main():
     if is_main_process(rank):
         logger.info(f"Distributed: {distributed} | world_size={world_size}")
         logger.info("===== Config =====")
-        logger.info(json.dumps({
-            "model": asdict(model_cfg), "data": asdict(data_cfg), "train": asdict(train_cfg)
-        }, indent=2, default=str))
+        full_cfg = {"model": asdict(model_cfg), "data": asdict(data_cfg), "train": asdict(train_cfg)}
+        logger.info(json.dumps(full_cfg, indent=2, default=str))
+
+    use_wandb = args.use_wandb and is_main_process(rank)
+    if args.use_wandb and not WANDB_AVAILABLE:
+        if is_main_process(rank):
+            logger.warning("--use_wandb was set but the 'wandb' package isn't installed. "
+                            "Run: pip install wandb. Continuing WITHOUT wandb logging.")
+        use_wandb = False
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_run_name,
+            config=full_cfg,
+            dir=train_cfg.output_dir,
+        )
+        logger.info(f"W&B run: {wandb.run.url}")
 
     # Same seed on every rank -> identical model init before DDP broadcast,
     # identical dropout patterns per-rank-position. DistributedSampler
@@ -406,8 +431,6 @@ def main():
     if is_main_process(rank):
         logger.info(f"Contextualizer trainable params: {n_trainable:,} | frozen (lookup table) params: {n_frozen:,}")
 
-    if is_main_process(rank):
-        logger.info(f"Loading dataset subsets: {data_cfg.subsets}")
     if args.prepared_dataset_dir:
         if is_main_process(rank):
             logger.info(f"Loading pre-built dataset from: {args.prepared_dataset_dir} (no network)")
@@ -422,6 +445,8 @@ def main():
             data_cfg.val_fraction, data_cfg.seed,
         )
     else:
+        if is_main_process(rank):
+            logger.info(f"Loading dataset subsets: {data_cfg.subsets} (percentage={data_cfg.dataset_percentage})")
         train_hf, val_hf = load_finetune_data(
             data_cfg.dataset_name, data_cfg.subsets, data_cfg.train_split, data_cfg.seed, data_cfg.val_fraction,
             dataset_percentage=data_cfg.dataset_percentage,
@@ -551,11 +576,21 @@ def main():
                         f"step={global_step}/{total_steps} loss={avg_loss:.4f} acc@1={avg_acc:.4f} "
                         f"lr={lr:.2e} grad_norm={grad_norm:.3f} sec/step={elapsed / train_cfg.logging_steps:.2f}"
                     )
+                    if use_wandb:
+                        wandb.log({
+                            "train/loss": avg_loss,
+                            "train/acc@1": avg_acc,
+                            "train/lr": lr,
+                            "train/grad_norm": grad_norm,
+                            "train/sec_per_step": elapsed / train_cfg.logging_steps,
+                        }, step=global_step)
                 running_loss, running_acc = 0.0, 0.0
                 t0 = time.time()
 
             if global_step % train_cfg.eval_steps == 0:
                 metric = evaluate(model, doc_model, val_loader, device, train_cfg.temperature, logger, distributed, world_size)
+                if is_main_process(rank) and use_wandb:
+                    wandb.log({"eval/acc@1": metric}, step=global_step)
                 if metric > best_metric:
                     best_metric = metric
                     if is_main_process(rank):
@@ -573,6 +608,8 @@ def main():
                      best_metric, train_cfg.save_total_limit, logger, rank)
     if is_main_process(rank):
         logger.info("Training complete.")
+        if use_wandb:
+            wandb.finish()
 
     if distributed:
         dist.barrier()

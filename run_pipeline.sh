@@ -5,6 +5,13 @@
 #                             dataset on disk (downloads once, cleans raw cache)
 #   2) train.py (via torchrun) -> trains ONLY from the local prepared dataset,
 #                             no further network access for data.
+#
+# Assumes: env already active, dependencies already installed,
+# EmbeddingBag .pt file already present.
+#
+# Usage:
+#   ./run_pipeline.sh
+#   DISK_BUDGET_GB=30 NUM_GPUS=2 ./run_pipeline.sh
 # =============================================================================
 set -euo pipefail
 
@@ -13,8 +20,7 @@ set -euo pipefail
 # --------------------------------------------------------------------------- #
 DATA_MIXTURE_CONFIG="${DATA_MIXTURE_CONFIG:-./lightretriever/config/data/exp-m.json}"
 DISK_BUDGET_GB="${DISK_BUDGET_GB:-50}"
-
-# Fallback defaults (used only if data mixture config is empty or "none")
+# Fallback (used only if DATA_MIXTURE_CONFIG file doesn't exist):
 SUBSETS="${SUBSETS:-msmarco}"
 DATASET_PERCENTAGE="${DATASET_PERCENTAGE:-10}"
 
@@ -25,29 +31,36 @@ FORCE_REPREPARE="${FORCE_REPREPARE:-0}"    # 1 = rebuild prepared dataset even i
 # --------------------------------------------------------------------------- #
 # DDP / hardware parameters
 # --------------------------------------------------------------------------- #
-NUM_GPUS="${NUM_GPUS:-2}"
+NUM_GPUS="${NUM_GPUS:-1}"
 NNODES="${NNODES:-1}"
 NODE_RANK="${NODE_RANK:-0}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29500}"
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 
 # --------------------------------------------------------------------------- #
 # Model / training parameters
 # --------------------------------------------------------------------------- #
 EMB_BAG_PATH="${EMB_BAG_PATH:-lightretriever_llama3.2-3b_official.emb_bag.pt}"
 DOC_MODEL="${DOC_MODEL:-lightretriever/lightretriever-llama3.2-3b}"
-BASE_MODEL_PATH="${BASE_MODEL_PATH:-/mnt/nas/shuvranshu/huggingface_cache/hub/models--meta-llama--Llama-3.2-3B/snapshots/13afe5124825b4f3751f836b40dafda64c1ed062}"   
+BASE_MODEL_PATH="${BASE_MODEL_PATH:-/mnt/nas/shuvranshu/huggingface_cache/hub/models--meta-llama--Llama-3.2-3B/snapshots/13afe5124825b4f3751f836b40dafda64c1ed062}"   # e.g. /data/models/llama-3.2-3b - local folder, skips re-download
 ATTN_IMPL="${ATTN_IMPL:-sdpa}"
 OUTPUT_DIR="${OUTPUT_DIR:-./outputs/contextualizer_llama3b}"
 
-PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-64}"
+PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-32}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-2}"
 NUM_EPOCHS="${NUM_EPOCHS:-1}"
 NUM_LAYERS="${NUM_LAYERS:-3}"
 LEARNING_RATE="${LEARNING_RATE:-2e-4}"
+LOGGING_STEPS="${LOGGING_STEPS:-1}"    # lower this (e.g. 1-5) for small/smoke-test datasets
+EVAL_STEPS="${EVAL_STEPS:-4}"         # must be <= total_steps to ever fire
+SAVE_STEPS="${SAVE_STEPS:-6}"         # same
 SEED="${SEED:-42}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
+USE_WANDB="${USE_WANDB:-1}"                       # 1 = enable W&B logging
+WANDB_PROJECT="${WANDB_PROJECT:-lightretriever-contextualizer}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-training_run_$(date +%Y%m%d_%H%M%S)}"
+WANDB_ENTITY="${WANDB_ENTITY:-}"
 
 if [[ -n "${CUDA_VISIBLE_DEVICES}" ]]; then
   export CUDA_VISIBLE_DEVICES
@@ -56,7 +69,7 @@ fi
 mkdir -p "${OUTPUT_DIR}" "${PREPARED_DATASET_DIR}"
 
 # --------------------------------------------------------------------------- #
-# Stage 1: prepare dataset
+# Stage 1: prepare dataset (skips itself if already built, unless FORCE_REPREPARE=1)
 # --------------------------------------------------------------------------- #
 echo "============================================================"
 echo " Stage 1: Dataset preparation"
@@ -67,45 +80,23 @@ if [[ "${FORCE_REPREPARE}" == "1" ]]; then
   FORCE_FLAG=(--force)
 fi
 
-# FIX: Check if mixture config is explicitly set to "none" or empty string
-if [[ "${DATA_MIXTURE_CONFIG}" == "none" || "${DATA_MIXTURE_CONFIG}" == "" ]]; then
-  echo "[BASH] Skipping budget allocation config. Building manual dataset targets..."
-  
-  # FIX: Check if explicit CLI flags were passed. If none were provided, use default strings.
-  if [[ $# -eq 0 ]]; then
-    python prepare_dataset.py \
-      --data_mixture_config "" \
-      --subsets ${SUBSETS} \
-      --dataset_percentage "${DATASET_PERCENTAGE}" \
-      --val_fraction "${VAL_FRACTION}" \
-      --seed "${SEED}" \
-      --output_dir "${PREPARED_DATASET_DIR}" \
-      "${FORCE_FLAG[@]}"
-  else
-    # FIX: Dynamically forward your precise manual terminal parameters ("$@") to python
-    python prepare_dataset.py \
-      --data_mixture_config "" \
-      --val_fraction "${VAL_FRACTION}" \
-      --seed "${SEED}" \
-      --output_dir "${PREPARED_DATASET_DIR}" \
-      "${FORCE_FLAG[@]}" \
-      "$@"
-  fi
+if [[ -f "${DATA_MIXTURE_CONFIG}" ]]; then
+  python prepare_dataset.py \
+    --data_mixture_config "${DATA_MIXTURE_CONFIG}" \
+    --disk_budget_gb "${DISK_BUDGET_GB}" \
+    --val_fraction "${VAL_FRACTION}" \
+    --seed "${SEED}" \
+    --output_dir "${PREPARED_DATASET_DIR}" \
+    "${FORCE_FLAG[@]}"
 else
-  # Budget fallback routing if path config evaluates to true
-  if [[ -f "${DATA_MIXTURE_CONFIG}" ]]; then
-    echo "[BASH] Loading budget mix profile from: ${DATA_MIXTURE_CONFIG}"
-    python prepare_dataset.py \
-      --data_mixture_config "${DATA_MIXTURE_CONFIG}" \
-      --disk_budget_gb "${DISK_BUDGET_GB}" \
-      --val_fraction "${VAL_FRACTION}" \
-      --seed "${SEED}" \
-      --output_dir "${PREPARED_DATASET_DIR}" \
-      "${FORCE_FLAG[@]}"
-  else
-    echo "[BASH] ERROR: Configuration targets missing. Aborting run."
-    exit 1
-  fi
+  echo "DATA_MIXTURE_CONFIG not found at '${DATA_MIXTURE_CONFIG}', falling back to plain subset selection."
+  python prepare_dataset.py \
+    --subsets ${SUBSETS} \
+    --dataset_percentage "${DATASET_PERCENTAGE}" \
+    --val_fraction "${VAL_FRACTION}" \
+    --seed "${SEED}" \
+    --output_dir "${PREPARED_DATASET_DIR}" \
+    "${FORCE_FLAG[@]}"
 fi
 
 # --------------------------------------------------------------------------- #
@@ -125,6 +116,13 @@ if [[ -n "${BASE_MODEL_PATH}" ]]; then
   BASE_MODEL_ARGS=(--base_model_path "${BASE_MODEL_PATH}")
 fi
 
+WANDB_ARGS=()
+if [[ "${USE_WANDB}" == "1" ]]; then
+  WANDB_ARGS=(--use_wandb --wandb_project "${WANDB_PROJECT}")
+  [[ -n "${WANDB_RUN_NAME}" ]] && WANDB_ARGS+=(--wandb_run_name "${WANDB_RUN_NAME}")
+  [[ -n "${WANDB_ENTITY}" ]] && WANDB_ARGS+=(--wandb_entity "${WANDB_ENTITY}")
+fi
+
 torchrun \
   --nproc_per_node="${NUM_GPUS}" \
   --nnodes="${NNODES}" \
@@ -142,7 +140,11 @@ torchrun \
     --num_train_epochs "${NUM_EPOCHS}" \
     --num_layers "${NUM_LAYERS}" \
     --learning_rate "${LEARNING_RATE}" \
+    --logging_steps "${LOGGING_STEPS}" \
+    --eval_steps "${EVAL_STEPS}" \
+    --save_steps "${SAVE_STEPS}" \
     --seed "${SEED}" \
     "${RESUME_ARGS[@]}" \
     "${BASE_MODEL_ARGS[@]}" \
+    "${WANDB_ARGS[@]}" \
   2>&1 | tee -a "${OUTPUT_DIR}/run_pipeline_stdout.log"
